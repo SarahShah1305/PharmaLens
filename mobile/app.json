@@ -2,6 +2,7 @@
   "expo": {
     "name": "PharmaLens",
     "slug": "pharmalens",
+    "scheme": "pharmalens",
     "version": "1.0.0",
     "orientation": "portrait",
     "plugins": [
@@ -12,7 +13,9 @@
           "cameraPermission": "Allow PharmaLens to take a prescription photo.",
           "microphonePermission": false
         }
-      ]
+      ],
+      "expo-router",
+      "expo-status-bar"
     ],
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -20,13 +23,13 @@
       "supportsTablet": true
     },
     "android": {
+      "predictiveBackGestureEnabled": true,
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
-      },
-      "predictiveBackGestureEnabled": false
+      }
     },
     "web": {
       "favicon": "./assets/favicon.png"

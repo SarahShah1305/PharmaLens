@@ -1,4 +1,5 @@
-anthropic
+google-genai
+httpx
 fastapi
 python-dotenv
 python-multipart
