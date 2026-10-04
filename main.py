@@ -23,11 +23,13 @@ app = FastAPI(title="PharmaLens", version="0.1.0")
 logger = logging.getLogger("uvicorn.error")
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 SUPPORTED_MEDIA_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
-allowed_origins = [
-    origin.strip()
-    for origin in os.getenv("CORS_ORIGINS", "http://localhost:8081,http://localhost:19006").split(",")
-    if origin.strip()
+default_allowed_origins = [
+    "http://localhost:8081",
+    "http://localhost:19006",
+    "https://pharmalens.expo.app",
 ]
+configured_origins = [origin.strip() for origin in os.getenv("CORS_ORIGINS", "").split(",") if origin.strip()]
+allowed_origins = list(dict.fromkeys([*default_allowed_origins, *configured_origins]))
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,

@@ -14,6 +14,12 @@ The result screen includes a frequency-based schedule preview, a read-aloud cont
 
 Expo Go runs the development app; it is not a public deployment. Deploy the API separately before testing away from your development network. Build an Android APK after the mobile app and API workflow have been reviewed.
 
+## Deploy the web app
+
+The hosted web build must use `EXPO_PUBLIC_API_URL` set to the API server's public HTTPS URL in the web build environment. Do not use `localhost`, a `192.168.x.x` address, or an HTTP API URL for the HTTPS website. Rebuild and redeploy the web app after changing this value.
+
+The API allows the production web origin `https://pharmalens.expo.app` by default. Add any additional web preview origins as comma-separated URLs in the server's `CORS_ORIGINS` environment variable. Redeploy/restart the API after changing server environment settings. Keep `GEMINI_API_KEY` only in the API server environment, never in the web app.
+
 ## API response expected
 
 `POST /extract` accepts multipart fields `file` and `language` (`English` or `Urdu`). Each medicine result keeps the shared `name`, `dose`, `frequency`, and `confidence` fields. It also returns bilingual fields such as `dose_english` and `dose_urdu`, plus an optional language-specific `explanation` and dose warning.

@@ -31,6 +31,8 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
 Visit `http://127.0.0.1:8000/docs` for the interactive API page. `GET /health` checks whether the server is running. `POST /extract` expects `file` (JPEG, PNG, GIF, or WebP; maximum 10 MB) and `language` (`English` or `Urdu`). For Expo Go on a phone, set `mobile/.env` to `EXPO_PUBLIC_API_URL=http://YOUR-MAC-IP:8000` and keep the phone and Mac on the same Wi-Fi.
 
+For the hosted web app, configure `EXPO_PUBLIC_API_URL` to the API's public HTTPS URL in the web build environment. The API allows `https://pharmalens.expo.app` by default; add other preview origins through the server's comma-separated `CORS_ORIGINS` setting. Redeploy the API after server-setting changes and rebuild/redeploy the web app after changing `EXPO_PUBLIC_API_URL`. Keep `GEMINI_API_KEY` only on the API server.
+
 ## Accuracy evaluation
 
 After Person 5 shares the labeled prescription photos and answer CSV, save them in a local folder. The CSV needs `image,name,dose,frequency` columns; each row represents one medicine, and `image` names its photo. If a photo has multiple medicines, repeat its filename once per medicine and add a zero-based `medicine_index` column to identify each result in order. An optional `language` column selects `English` or `Urdu` for each request.

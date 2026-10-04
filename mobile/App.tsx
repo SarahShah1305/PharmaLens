@@ -145,11 +145,11 @@ export function PharmaLensScreen({ screen }: { screen: Screen }) {
 
   const readAloud = async (key: string, text: string, languageCode: string) => {
     if (speakingKey === key) {
-      void Speech.stop();
+      await Speech.stop().catch(() => undefined);
       setSpeakingKey(null);
       return;
     }
-    void Speech.stop();
+    await Speech.stop().catch(() => undefined);
     setSpeakingKey(key);
     try {
       const voices = await Speech.getAvailableVoicesAsync() as Array<{ language: string; identifier: string; quality?: string }>;
@@ -157,21 +157,25 @@ export function PharmaLensScreen({ screen }: { screen: Screen }) {
       const matchingVoice = voices
         .filter((voice) => voice.language.toLowerCase().startsWith(requestedLanguage.slice(0, 2)))
         .sort((a, b) => Number(b.quality === 'Enhanced') - Number(a.quality === 'Enhanced'))[0];
-      if (requestedLanguage.startsWith('ur') && !matchingVoice) {
-        setSpeakingKey(null);
-        Alert.alert('Urdu voice is not installed', 'Add an Urdu text-to-speech voice in your phone settings, then try again.');
-        return;
-      }
-      Speech.speak(text, {
+      const speechOptions = {
         language: matchingVoice?.language ?? languageCode,
         voice: matchingVoice?.identifier,
         rate: requestedLanguage.startsWith('ur') ? 0.78 : 0.9,
-        onDone: () => setSpeakingKey((active) => active === key ? null : active),
         onStopped: () => setSpeakingKey((active) => active === key ? null : active),
         onError: () => {
+          void Speech.stop();
           setSpeakingKey((active) => active === key ? null : active);
           Alert.alert('Read aloud unavailable', 'Check that your phone has a speech voice for this language.');
         },
+      };
+      const utterances = (text.match(/[^.!?؟۔]+[.!?؟۔]?/gu) ?? [text]).map((part) => part.trim()).filter(Boolean);
+      utterances.forEach((part, index) => {
+        Speech.speak(part, {
+          ...speechOptions,
+          onDone: index === utterances.length - 1
+            ? () => setSpeakingKey((active) => active === key ? null : active)
+            : undefined,
+        });
       });
     } catch {
       setSpeakingKey(null);
@@ -265,6 +269,10 @@ export function PharmaLensScreen({ screen }: { screen: Screen }) {
       setError(showUrdu ? 'موبائل کی .env فائل میں چلتے ہوئے سرور کا پتہ درج کریں۔' : 'Set EXPO_PUBLIC_API_URL in mobile/.env to your running server address.');
       return;
     }
+    if (Platform.OS === 'web' && typeof window !== 'undefined' && window.location.protocol === 'https:' && !API_URL.startsWith('https://')) {
+      setError('The deployed website needs a public HTTPS API URL. Set EXPO_PUBLIC_API_URL in the web deployment settings, then redeploy the web app.');
+      return;
+    }
 
     setBusy(true);
     setError('');
@@ -337,9 +345,11 @@ export function PharmaLensScreen({ screen }: { screen: Screen }) {
       setError(
         showUrdu
           ? urduRequestError(message)
-          : message.includes('Network request failed')
-            ? `Could not reach ${API_URL}. Check that the server is running and that your phone can reach your computer.`
-            : message,
+          : Platform.OS === 'web' && /network request failed|load failed|failed to fetch|networkerror/i.test(message)
+            ? `Could not reach ${API_URL}. Check that it is a public HTTPS API URL and that the API allows requests from https://pharmalens.expo.app.`
+            : message.includes('Network request failed')
+              ? `Could not reach ${API_URL}. Check that the server is running and that your phone can reach your computer.`
+              : message,
       );
     } finally {
       if (timeoutId) clearTimeout(timeoutId);
@@ -627,7 +637,11 @@ function Results({
           : medicine.purpose_en || medicine.explanation || 'A common-use description is unavailable. Ask your pharmacist or doctor.';
         const shownName = showUrdu ? medicine.name_as_written || 'غیر واضح' : medicine.name || medicine.name_as_written || 'unclear';
         const speechKey = `medicine-${index}`;
-        const speechName = showUrdu ? medicine.name_as_written || 'غیر واضح' : medicine.name || medicine.name_as_written || 'unclear';
+        const speechName = showUrdu
+          ? medicine.name?.trim() && !isUnclear(medicine.name)
+            ? medicine.name.trim()
+            : 'Medicine name unclear'
+          : medicine.name || medicine.name_as_written || 'unclear';
         const speechDose = showUrdu ? medicine.dose_urdu || 'خوراک غیر واضح' : medicine.dose || 'Dose unclear';
         const speechFrequency = showUrdu ? medicine.frequency_urdu || 'استعمال کی تکرار واضح نہیں' : medicine.frequency || 'Frequency unclear';
         const speechWarning = [
@@ -647,7 +661,7 @@ function Results({
           : 'Confirm with your pharmacist or doctor. PharmaLens can misread handwriting and is not medical advice.';
         const speechPurpose = explanation;
         const speechText = showUrdu
-          ? [speechName, `خوراک: ${speechDose}`, `استعمال کی تکرار: ${speechFrequency}`, speechPurpose, speechWarning, speechConfidence, speechUnclear, speechCaution].filter(Boolean).join('۔ ')
+          ? speechName
           : [speechName, `Dose: ${speechDose}`, `Frequency: ${speechFrequency}`, speechPurpose, speechWarning, speechConfidence, speechUnclear, speechCaution].filter(Boolean).join('. ');
         return (
         <View key={`${medicine.name ?? 'medicine'}-${index}`} style={styles.medicineCard}>
@@ -668,7 +682,7 @@ function Results({
           {medicine.explanation_source_url ? <Pressable accessibilityRole="link" onPress={() => { void Linking.openURL(medicine.explanation_source_url!); }} style={styles.sourceLink}><Text style={styles.sourceLinkText}>{showUrdu ? `ماخذ: ${medicine.explanation_source_title || 'طبی حوالہ'}` : `Source: ${medicine.explanation_source_title || 'medical reference'}`}</Text></Pressable> : null}
           <Pressable
             accessibilityRole="button"
-            onPress={() => onReadAloud(speechKey, speechText, showUrdu ? 'ur-PK' : 'en-US')}
+            onPress={() => onReadAloud(speechKey, speechText, 'en-US')}
             style={({ pressed }) => [styles.listenButton, pressed && styles.pressed]}
           >
             <Text style={styles.listenButtonText}>{speakingKey === speechKey ? 'Stop reading' : '🔊 Read this medicine box aloud'}</Text>
