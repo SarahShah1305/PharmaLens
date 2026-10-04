@@ -4,13 +4,17 @@ import * as ImagePicker from 'expo-image-picker';
 import * as FileSystem from 'expo-file-system/legacy';
 import { ImageManipulator, SaveFormat } from 'expo-image-manipulator';
 import { useRouter } from 'expo-router';
+import { setAudioModeAsync, useAudioPlayer, useAudioPlayerStatus } from 'expo-audio';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { useEffect } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
+  Animated,
   ActivityIndicator,
   Alert,
   Image,
+  Linking,
   Pressable,
+  Platform,
   ScrollView,
   StyleSheet,
   Text,
@@ -32,6 +36,10 @@ type Medicine = {
   explanation?: string;
   explanation_language?: 'en' | 'ur';
   generic_name?: string;
+  purpose_en?: string;
+  purpose_ur?: string;
+  explanation_source_title?: string;
+  explanation_source_url?: string;
   dose_warning?: string;
   confidence?: number;
 };
@@ -47,12 +55,18 @@ type ExtractionResult = {
 };
 
 const API_URL = (process.env.EXPO_PUBLIC_API_URL ?? '').replace(/\/$/, '');
-const REQUEST_TIMEOUT_MS = 70_000;
-type Screen = 'language' | 'photo' | 'schedule' | 'result' | 'history';
+const REQUEST_TIMEOUT_MS = 180_000;
+type Screen = 'start' | 'language' | 'photo' | 'schedule' | 'result' | 'history';
 
 export function PharmaLensScreen({ screen }: { screen: Screen }) {
   const router = useRouter();
+  const shutterPlayer = useAudioPlayer(require('./assets/sounds/camera-shutter.wav'));
+  const shutterStatus = useAudioPlayerStatus(shutterPlayer);
   const session = usePharmaLensSession();
+  const [launching, setLaunching] = useState(false);
+  const [shutterPending, setShutterPending] = useState(false);
+  const capsuleRotation = useRef(new Animated.Value(0)).current;
+  const snapProgress = useRef(new Animated.Value(0)).current;
   const { language, photo, busy, error, history, historyError, speakingKey } = session;
   const result = session.result as ExtractionResult | null;
   const showUrdu = language === 'Urdu' && (screen === 'schedule' || screen === 'result');
@@ -66,6 +80,59 @@ export function PharmaLensScreen({ screen }: { screen: Screen }) {
   const setSpeakingKey = (value: string | null | ((current: string | null) => string | null)) => updatePharmaLensSession((current) => ({ ...current, speakingKey: typeof value === 'function' ? value(current.speakingKey) : value }));
 
   useEffect(() => {
+    void setAudioModeAsync({ playsInSilentMode: true }).catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    if (screen !== 'start' || launching) return;
+    capsuleRotation.setValue(0);
+    const spin = Animated.loop(Animated.timing(capsuleRotation, {
+      toValue: 1,
+      duration: 4200,
+      useNativeDriver: true,
+    }));
+    spin.start();
+    return () => spin.stop();
+  }, [capsuleRotation, launching, screen]);
+
+  const playShutterAndSnap = () => {
+    shutterPlayer.volume = 1;
+    shutterPlayer.seekTo(0);
+    shutterPlayer.play();
+    Animated.timing(snapProgress, { toValue: 1, duration: 115, useNativeDriver: true }).start(({ finished }) => {
+      if (finished) router.push('/language');
+      setLaunching(false);
+      snapProgress.setValue(0);
+    });
+  };
+
+  useEffect(() => {
+    if (screen === 'start' && shutterPending && shutterStatus.isLoaded) {
+      setShutterPending(false);
+      playShutterAndSnap();
+    }
+  }, [screen, shutterPending, shutterStatus.isLoaded]);
+
+  const continueFromStart = () => {
+    if (launching) return;
+    setLaunching(true);
+    try {
+      if (shutterStatus.isLoaded) playShutterAndSnap();
+      else setShutterPending(true);
+    } catch {
+      // Keep the transition working if audio playback is unavailable.
+      setShutterPending(false);
+      setLaunching(false);
+    }
+  };
+
+  const startReading = () => {
+    if (!language) { setError('Choose English or Urdu to continue.'); return; }
+    setError('');
+    router.push('/photo');
+  };
+
+  useEffect(() => {
     let mounted = true;
     loadHistory()
       .then((items) => { if (mounted) setHistory(items); })
@@ -76,7 +143,7 @@ export function PharmaLensScreen({ screen }: { screen: Screen }) {
     };
   }, []);
 
-  const readAloud = (key: string, text: string, languageCode: string) => {
+  const readAloud = async (key: string, text: string, languageCode: string) => {
     if (speakingKey === key) {
       void Speech.stop();
       setSpeakingKey(null);
@@ -84,16 +151,32 @@ export function PharmaLensScreen({ screen }: { screen: Screen }) {
     }
     void Speech.stop();
     setSpeakingKey(key);
-    Speech.speak(text, {
-      language: languageCode,
-      rate: 0.9,
-      onDone: () => setSpeakingKey((active) => active === key ? null : active),
-      onStopped: () => setSpeakingKey((active) => active === key ? null : active),
-      onError: () => {
-        setSpeakingKey((active) => active === key ? null : active);
-        Alert.alert('Read aloud unavailable', 'Check that your phone has a speech voice for this language.');
-      },
-    });
+    try {
+      const voices = await Speech.getAvailableVoicesAsync() as Array<{ language: string; identifier: string; quality?: string }>;
+      const requestedLanguage = languageCode.toLowerCase();
+      const matchingVoice = voices
+        .filter((voice) => voice.language.toLowerCase().startsWith(requestedLanguage.slice(0, 2)))
+        .sort((a, b) => Number(b.quality === 'Enhanced') - Number(a.quality === 'Enhanced'))[0];
+      if (requestedLanguage.startsWith('ur') && !matchingVoice) {
+        setSpeakingKey(null);
+        Alert.alert('Urdu voice is not installed', 'Add an Urdu text-to-speech voice in your phone settings, then try again.');
+        return;
+      }
+      Speech.speak(text, {
+        language: matchingVoice?.language ?? languageCode,
+        voice: matchingVoice?.identifier,
+        rate: requestedLanguage.startsWith('ur') ? 0.78 : 0.9,
+        onDone: () => setSpeakingKey((active) => active === key ? null : active),
+        onStopped: () => setSpeakingKey((active) => active === key ? null : active),
+        onError: () => {
+          setSpeakingKey((active) => active === key ? null : active);
+          Alert.alert('Read aloud unavailable', 'Check that your phone has a speech voice for this language.');
+        },
+      });
+    } catch {
+      setSpeakingKey(null);
+      Alert.alert('Read aloud unavailable', 'Could not load the speech voices on this phone.');
+    }
   };
 
   useEffect(() => {
@@ -188,33 +271,56 @@ export function PharmaLensScreen({ screen }: { screen: Screen }) {
     setResult(null);
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
     try {
-      const uploadTask = FileSystem.createUploadTask(`${API_URL}/extract`, photo.uri, {
-        fieldName: 'file',
-        mimeType: photo.mimeType,
-        httpMethod: 'POST',
-        uploadType: FileSystem.FileSystemUploadType.MULTIPART,
-        parameters: { language },
-      });
-      const timeout = new Promise<never>((_, reject) => {
-        timeoutId = setTimeout(() => {
-          void uploadTask.cancelAsync().catch(() => undefined);
-          reject(new Error('The request timed out after 70 seconds. Check that the API server is running and try again.'));
-        }, REQUEST_TIMEOUT_MS);
-      });
-      const response = await Promise.race([uploadTask.uploadAsync(), timeout]);
-      if (timeoutId) clearTimeout(timeoutId);
-      if (!response) {
-        throw new Error('The upload was cancelled. Please try again.');
+      let responseStatus: number;
+      let responseBody: string;
+      if (Platform.OS === 'web') {
+        const controller = new AbortController();
+        timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+        const imageResponse = await fetch(photo.uri);
+        const imageBlob = await imageResponse.blob();
+        const form = new FormData();
+        form.append('file', imageBlob, photo.fileName || 'prescription.jpg');
+        form.append('language', language);
+        const webResponse = await fetch(`${API_URL}/extract`, {
+          method: 'POST',
+          body: form,
+          signal: controller.signal,
+        });
+        responseStatus = webResponse.status;
+        responseBody = await webResponse.text();
+      } else {
+        const uploadTask = FileSystem.createUploadTask(`${API_URL}/extract`, photo.uri, {
+          fieldName: 'file',
+          mimeType: photo.mimeType,
+          httpMethod: 'POST',
+          uploadType: FileSystem.FileSystemUploadType.MULTIPART,
+          parameters: { language },
+        });
+        const timeout = new Promise<never>((_, reject) => {
+          timeoutId = setTimeout(() => {
+            void uploadTask.cancelAsync().catch(() => undefined);
+            reject(new Error('The request timed out after 3 minutes. Check that the API server is running and try again.'));
+          }, REQUEST_TIMEOUT_MS);
+        });
+        const nativeResponse = await Promise.race([uploadTask.uploadAsync(), timeout]);
+        if (!nativeResponse) throw new Error('The upload was cancelled. Please try again.');
+        responseStatus = nativeResponse.status;
+        responseBody = nativeResponse.body;
       }
+      if (timeoutId) clearTimeout(timeoutId);
       let payload: ExtractionResult & { detail?: string };
       try {
-        payload = JSON.parse(response.body) as ExtractionResult & { detail?: string };
+        payload = JSON.parse(responseBody) as ExtractionResult & { detail?: string };
       } catch {
-        const status = response.status ? ` (HTTP ${response.status})` : '';
-        throw new Error(`The server returned an unreadable response${status}. Check the API server terminal and try again.`);
+        const status = responseStatus ? ` (HTTP ${responseStatus})` : '';
+        const body = responseBody.trim();
+        const message = body && body !== 'Internal Server Error'
+          ? body.slice(0, 240)
+          : 'The API returned a non-JSON error. Check the API server terminal for the traceback.';
+        throw new Error(`Server error${status}: ${message}`);
       }
-      if (response.status < 200 || response.status >= 300) {
-        throw new Error(payload.detail ?? `The server could not read this image (HTTP ${response.status}).`);
+      if (responseStatus < 200 || responseStatus >= 300) {
+        throw new Error(payload.detail ?? `The server could not read this image (HTTP ${responseStatus}).`);
       }
       const reading = payload;
       setResult(reading);
@@ -244,22 +350,28 @@ export function PharmaLensScreen({ screen }: { screen: Screen }) {
   return (
     <SafeAreaView style={styles.screen} edges={['top', 'bottom']}>
       <StatusBar style="dark" />
-      <ScrollView contentContainerStyle={styles.content}>
-        <View style={styles.brandRow}>
-          <View style={styles.brandMark}>
-            <View style={[styles.markCorner, styles.markTopLeft]} />
-            <View style={[styles.markCorner, styles.markTopRight]} />
-            <View style={[styles.markCorner, styles.markBottomLeft]} />
-            <View style={[styles.markCorner, styles.markBottomRight]} />
-            <View style={styles.markCapsule}><View style={styles.markCapsuleSeam} /></View>
-          </View>
+      <ScrollView contentContainerStyle={[styles.content, screen === 'start' && styles.introContent]}>
+        {screen !== 'start' && <View style={styles.brandRow}>
+          <LogoMark large={false} rotation={capsuleRotation} snapProgress={snapProgress} />
           <Text style={styles.brandName}>Pharma<Text style={styles.brandAccent}>Lens</Text></Text>
           {screen !== 'history' && <Pressable accessibilityRole="button" onPress={() => { setError(''); router.push('/history'); }} style={styles.headerAction}>
             <Text style={styles.headerActionText}>History</Text>
           </Pressable>}
-        </View>
+        </View>}
 
-        {screen !== 'history' && <ProgressSteps current={screen === 'language' ? 1 : screen === 'photo' ? 2 : screen === 'result' ? 3 : 4} />}
+        {(screen === 'language' || screen === 'photo' || screen === 'result' || screen === 'schedule') && <ProgressSteps current={screen === 'language' ? 1 : screen === 'photo' ? 2 : screen === 'result' ? 3 : 4} />}
+
+        {screen === 'start' && (
+          <View style={styles.introScreen}>
+            <Text style={styles.welcomeTitle}>Welcome to PharmaLens</Text>
+            <Text style={styles.welcomeSubtitle}>A helpful guide to reading English and Urdu prescriptions.</Text>
+            <View style={styles.largeLogoHalo}>
+              <LogoMark large rotation={capsuleRotation} snapProgress={snapProgress} />
+            </View>
+            <Text style={styles.introDescription}>Understand medicine names and directions, one prescription at a time.</Text>
+            <PrimaryButton label={launching ? 'Opening…' : 'Continue'} onPress={continueFromStart} disabled={launching} />
+          </View>
+        )}
 
         {screen === 'language' && (
           <>
@@ -276,10 +388,8 @@ export function PharmaLensScreen({ screen }: { screen: Screen }) {
               <Text style={styles.infoTitle}>Careful reading</Text>
               <Text style={styles.infoText}>We keep medicine names and doses as written. Anything unclear is marked for you to confirm.</Text>
             </View>
-            <PrimaryButton label="Continue to photo" onPress={() => {
-          if (!language) { setError('Choose English or Urdu to continue.'); return; }
-              setError(''); router.push('/photo');
-            }} />
+            {error ? <Text accessibilityRole="alert" style={styles.error}>{error}</Text> : null}
+            <PrimaryButton label="Continue to photo" onPress={startReading} />
           </>
         )}
 
@@ -367,17 +477,51 @@ export function PharmaLensScreen({ screen }: { screen: Screen }) {
   );
 }
 
+function LogoMark({
+  large,
+  rotation,
+  snapProgress,
+}: {
+  large: boolean;
+  rotation: Animated.Value;
+  snapProgress: Animated.Value;
+}) {
+  const logoSize = large ? 220 : 42;
+  const cornerSize = large ? 32 : 9;
+  const inset = large ? 38 : 9;
+  const stroke = large ? 4 : 2;
+  const snapDistance = large ? 44 : 6;
+  const spin = rotation.interpolate({ inputRange: [0, 1], outputRange: ['0deg', '360deg'] });
+  const scale = snapProgress.interpolate({ inputRange: [0, 1], outputRange: [1, 0.84] });
+  const inward = snapProgress.interpolate({ inputRange: [0, 1], outputRange: [0, snapDistance] });
+  const pillStyle = [styles.markCapsule, large && styles.markCapsuleLarge, {
+    transform: [{ rotate: '-42deg' }, { rotate: spin }, { scale }],
+  }];
+
+  return (
+    <View style={[styles.brandMark, large && styles.brandMarkLarge, { width: logoSize, height: logoSize }]}>
+      <Animated.View style={[styles.markCorner, { width: cornerSize, height: cornerSize, top: inset, left: inset, borderTopWidth: stroke, borderLeftWidth: stroke, transform: [{ translateX: inward }, { translateY: inward }] }]} />
+      <Animated.View style={[styles.markCorner, { width: cornerSize, height: cornerSize, top: inset, right: inset, borderTopWidth: stroke, borderRightWidth: stroke, transform: [{ translateX: Animated.multiply(inward, -1) }, { translateY: inward }] }]} />
+      <Animated.View style={[styles.markCorner, { width: cornerSize, height: cornerSize, bottom: inset, left: inset, borderBottomWidth: stroke, borderLeftWidth: stroke, transform: [{ translateX: inward }, { translateY: Animated.multiply(inward, -1) }] }]} />
+      <Animated.View style={[styles.markCorner, { width: cornerSize, height: cornerSize, bottom: inset, right: inset, borderBottomWidth: stroke, borderRightWidth: stroke, transform: [{ translateX: Animated.multiply(inward, -1) }, { translateY: Animated.multiply(inward, -1) }] }]} />
+      <Animated.View style={pillStyle}>
+        <View style={[styles.markCapsuleSeam, large && styles.markCapsuleSeamLarge]} />
+      </Animated.View>
+    </View>
+  );
+}
+
 function ProgressSteps({ current }: { current: number }) {
   const labels = ['Language', 'Photo', 'Results', 'Schedule'];
   return (
     <View accessibilityLabel={`Step ${current} of 4`} style={styles.progressWrap}>
+      <View style={styles.progressRail}><View style={[styles.progressRailActive, { width: `${((current - 1) / 3) * 100}%` }]} /></View>
       {labels.map((label, index) => {
         const number = index + 1;
         const active = number === current;
         const complete = number < current;
         return (
           <View key={label} style={styles.progressItem}>
-            <View style={[styles.progressLine, index > 0 && (complete || active) && styles.progressLineActive]} />
             <View style={[styles.progressDot, active && styles.progressDotActive, complete && styles.progressDotComplete]}>
               <Text style={[styles.progressNumber, (active || complete) && styles.progressNumberActive]}>{complete ? '✓' : number}</Text>
             </View>
@@ -479,14 +623,19 @@ function Results({
         const doseUnclear = isUnclear(showUrdu ? medicine.dose_urdu : medicine.dose) || lowConfidence;
         const frequencyUnclear = isUnclear(showUrdu ? medicine.frequency_urdu : medicine.frequency) || lowConfidence;
         const explanation = showUrdu
-          ? (medicine.explanation_language === 'ur' ? medicine.explanation : medicine.urdu_explanation) || 'اس دوا کی سادہ اردو وضاحت دستیاب نہیں۔ اپنے فارماسسٹ یا ڈاکٹر سے پوچھیں۔'
-          : (medicine.explanation_language === 'en' ? medicine.explanation : medicine.explanation) || 'A simple explanation is unavailable. Ask your pharmacist or doctor.';
+          ? medicine.purpose_ur || medicine.urdu_explanation || 'اس دوا کا عام استعمال دستیاب نہیں۔ اپنے فارماسسٹ یا ڈاکٹر سے پوچھیں۔'
+          : medicine.purpose_en || medicine.explanation || 'A common-use description is unavailable. Ask your pharmacist or doctor.';
         const shownName = showUrdu ? medicine.name_as_written || 'غیر واضح' : medicine.name || medicine.name_as_written || 'unclear';
         const speechKey = `medicine-${index}`;
         const speechName = showUrdu ? medicine.name_as_written || 'غیر واضح' : medicine.name || medicine.name_as_written || 'unclear';
         const speechDose = showUrdu ? medicine.dose_urdu || 'خوراک غیر واضح' : medicine.dose || 'Dose unclear';
         const speechFrequency = showUrdu ? medicine.frequency_urdu || 'استعمال کی تکرار واضح نہیں' : medicine.frequency || 'Frequency unclear';
-        const speechWarning = medicine.dose_warning ? (showUrdu ? urduDoseWarning(medicine.dose_warning) : medicine.dose_warning) : '';
+        const speechWarning = [
+          showUrdu
+            ? 'عام استعمال کی یہ وضاحت AI نے بنائی ہے اور اس کی تصدیق نہیں کی گئی۔'
+            : 'This AI-generated common-use description is not verified.',
+          medicine.dose_warning ? (showUrdu ? urduDoseWarning(medicine.dose_warning) : medicine.dose_warning) : '',
+        ].filter(Boolean).join(' ');
         const speechConfidence = typeof medicine.confidence === 'number'
           ? (showUrdu ? `قرأت کا اعتماد ${Math.round(medicine.confidence * 100)} فیصد` : `Reading confidence ${Math.round(medicine.confidence * 100)} percent`)
           : '';
@@ -496,7 +645,10 @@ function Results({
         const speechCaution = showUrdu
           ? 'دوا لینے سے پہلے اپنے فارماسسٹ یا ڈاکٹر سے تصدیق کریں۔ فارما لینس تحریر غلط پڑھ سکتا ہے اور طبی مشورے کا متبادل نہیں ہے۔'
           : 'Confirm with your pharmacist or doctor. PharmaLens can misread handwriting and is not medical advice.';
-        const speechText = [speechName, showUrdu ? `خوراک: ${speechDose}` : `Dose: ${speechDose}`, showUrdu ? `استعمال کی تکرار: ${speechFrequency}` : `Frequency: ${speechFrequency}`, explanation, speechWarning, speechConfidence, speechUnclear, speechCaution].filter(Boolean).join('. ');
+        const speechPurpose = explanation;
+        const speechText = showUrdu
+          ? [speechName, `خوراک: ${speechDose}`, `استعمال کی تکرار: ${speechFrequency}`, speechPurpose, speechWarning, speechConfidence, speechUnclear, speechCaution].filter(Boolean).join('۔ ')
+          : [speechName, `Dose: ${speechDose}`, `Frequency: ${speechFrequency}`, speechPurpose, speechWarning, speechConfidence, speechUnclear, speechCaution].filter(Boolean).join('. ');
         return (
         <View key={`${medicine.name ?? 'medicine'}-${index}`} style={styles.medicineCard}>
           <View style={[styles.medicineHeading, showUrdu && styles.rtlRow]}>
@@ -512,7 +664,8 @@ function Results({
           </View>
           {!showUrdu && medicine.dose_english ? <Detail label="DOSE IN ENGLISH" value={medicine.dose_english} /> : null}
           {!showUrdu && medicine.frequency_english ? <Detail label="FREQUENCY" value={medicine.frequency_english} /> : null}
-          <Detail label={showUrdu ? 'سادہ وضاحت' : 'SIMPLE EXPLANATION'} value={explanation} rtl={showUrdu} showUrdu={showUrdu} />
+          <Detail label={showUrdu ? 'عام استعمال' : 'COMMON USE'} value={explanation} rtl={showUrdu} showUrdu={showUrdu} />
+          {medicine.explanation_source_url ? <Pressable accessibilityRole="link" onPress={() => { void Linking.openURL(medicine.explanation_source_url!); }} style={styles.sourceLink}><Text style={styles.sourceLinkText}>{showUrdu ? `ماخذ: ${medicine.explanation_source_title || 'طبی حوالہ'}` : `Source: ${medicine.explanation_source_title || 'medical reference'}`}</Text></Pressable> : null}
           <Pressable
             accessibilityRole="button"
             onPress={() => onReadAloud(speechKey, speechText, showUrdu ? 'ur-PK' : 'en-US')}
@@ -520,7 +673,12 @@ function Results({
           >
             <Text style={styles.listenButtonText}>{speakingKey === speechKey ? 'Stop reading' : '🔊 Read this medicine box aloud'}</Text>
           </Pressable>
-          {medicine.dose_warning ? <Text style={[styles.warning, showUrdu && styles.urduText]}>{showUrdu ? urduDoseWarning(medicine.dose_warning) : medicine.dose_warning}</Text> : null}
+          <Text style={[styles.warning, showUrdu && styles.urduText]}>
+            {showUrdu
+              ? 'عام استعمال کی وضاحت AI نے بنائی ہے اور اس کی تصدیق نہیں کی گئی۔ دوا اور خوراک فارماسسٹ یا ڈاکٹر سے تصدیق کریں۔'
+              : 'Common-use information is AI-generated and not verified. Confirm the medicine and dose with a pharmacist or doctor.'}
+            {medicine.dose_warning ? ` ${showUrdu ? urduDoseWarning(medicine.dose_warning) : medicine.dose_warning}` : ''}
+          </Text>
           {typeof medicine.confidence === 'number' ? (
             <Text style={[styles.confidence, showUrdu && styles.urduText]}>{showUrdu ? `قرأت کا اعتماد: ${Math.round(medicine.confidence * 100)}٪` : `Reading confidence: ${Math.round(medicine.confidence * 100)}%`}</Text>
           ) : null}
@@ -532,7 +690,6 @@ function Results({
       }) : <Text style={styles.bodyText}>No medicine entries were returned. Ask a pharmacist to read the prescription.</Text>}
 
       {!showUrdu && result.notes_english ? <Text style={styles.resultNote}>{result.notes_english}</Text> : null}
-      <Text style={styles.resultSafety}>Confirm these details with a pharmacist or doctor.</Text>
     </View>
   );
 }
@@ -660,26 +817,31 @@ function HistorySection({
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: '#F4EFE5' },
   content: { paddingHorizontal: 20, paddingTop: 16, paddingBottom: 36 },
+  introContent: { flexGrow: 1, justifyContent: 'center', paddingHorizontal: 28, paddingTop: 24, paddingBottom: 30 },
+  introScreen: { flexGrow: 1, justifyContent: 'center', alignItems: 'center', width: '100%' },
+  largeLogoHalo: { width: 260, height: 260, borderRadius: 130, backgroundColor: '#5146DA', alignItems: 'center', justifyContent: 'center', marginBottom: 28 },
+  welcomeTitle: { color: '#292544', fontSize: 33, lineHeight: 40, fontWeight: '900', textAlign: 'center', letterSpacing: -0.7 },
+  welcomeSubtitle: { color: '#6E685F', fontSize: 14, lineHeight: 21, textAlign: 'center', marginTop: 8, marginBottom: 28, maxWidth: 310 },
+  introDescription: { color: '#6E685F', fontSize: 13, lineHeight: 20, textAlign: 'center', marginBottom: 18, maxWidth: 310 },
   brandRow: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 18 },
   brandMark: { width: 42, height: 42, borderRadius: 13, backgroundColor: '#F5B84B', alignItems: 'center', justifyContent: 'center' },
+  brandMarkLarge: { borderRadius: 46 },
   markCorner: { position: 'absolute', width: 9, height: 9, borderColor: '#292544' },
-  markTopLeft: { top: 9, left: 9, borderTopWidth: 2, borderLeftWidth: 2 },
-  markTopRight: { top: 9, right: 9, borderTopWidth: 2, borderRightWidth: 2 },
-  markBottomLeft: { bottom: 9, left: 9, borderBottomWidth: 2, borderLeftWidth: 2 },
-  markBottomRight: { bottom: 9, right: 9, borderBottomWidth: 2, borderRightWidth: 2 },
-  markCapsule: { width: 17, height: 8, borderRadius: 5, backgroundColor: '#FFFFFF', transform: [{ rotate: '-42deg' }], alignItems: 'center', justifyContent: 'center' },
+  markCapsule: { width: 17, height: 8, borderRadius: 5, backgroundColor: '#FFFFFF', alignItems: 'center', justifyContent: 'center' },
+  markCapsuleLarge: { width: 82, height: 36, borderRadius: 20 },
   markCapsuleSeam: { width: 1.5, height: 7, backgroundColor: '#4D43D6' },
+  markCapsuleSeamLarge: { width: 3, height: 31 },
   brandName: { color: '#292544', fontSize: 18, fontWeight: '900', flex: 1, letterSpacing: -0.5 },
   brandAccent: { color: '#5146DA' },
   headerAction: { paddingHorizontal: 13, paddingVertical: 9, borderRadius: 10, backgroundColor: '#FFFDFA', borderWidth: 1, borderColor: '#DDD6CA' },
   headerActionText: { color: '#5146DA', fontSize: 12, fontWeight: '800' },
   sectionTitle: { color: '#292544', fontSize: 16, fontWeight: '900', marginBottom: 10 },
   version: { color: '#827C72', fontSize: 8, fontWeight: '800', letterSpacing: 0.7 },
-  progressWrap: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 4, marginBottom: 26 },
-  progressItem: { flex: 1, alignItems: 'center', position: 'relative' },
-  progressLine: { position: 'absolute', height: 2, backgroundColor: '#DDD6CA', width: '100%', left: '-50%', top: 14 },
-  progressLineActive: { backgroundColor: '#5146DA' },
-  progressDot: { width: 29, height: 29, borderRadius: 15, borderWidth: 1.5, borderColor: '#CFC8BC', backgroundColor: '#FFFDFA', alignItems: 'center', justifyContent: 'center' },
+  progressWrap: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 4, marginBottom: 26, position: 'relative' },
+  progressRail: { position: 'absolute', height: 2, backgroundColor: '#DDD6CA', left: '12.5%', right: '12.5%', top: 14, zIndex: 0 },
+  progressRailActive: { height: 2, backgroundColor: '#5146DA' },
+  progressItem: { flex: 1, alignItems: 'center', position: 'relative', zIndex: 1 },
+  progressDot: { width: 29, height: 29, borderRadius: 15, borderWidth: 1.5, borderColor: '#CFC8BC', backgroundColor: '#F4EFE5', alignItems: 'center', justifyContent: 'center', zIndex: 2, elevation: 2 },
   progressDotActive: { borderColor: '#5146DA', backgroundColor: '#5146DA' },
   progressDotComplete: { borderColor: '#5146DA', backgroundColor: '#ECEBFA' },
   progressNumber: { color: '#827C72', fontSize: 11, fontWeight: '800' },
@@ -772,7 +934,8 @@ const styles = StyleSheet.create({
   historyDelete: { paddingVertical: 8, paddingHorizontal: 5 },
   historyDeleteText: { color: '#983D3C', fontSize: 10, fontWeight: '800' },
   resultNote: { color: '#5F5A50', fontSize: 13, lineHeight: 20, marginTop: 12 },
-  resultSafety: { color: '#514019', backgroundColor: '#F8E7B9', borderRadius: 9, padding: 12, fontSize: 12, lineHeight: 18, marginTop: 13 },
+  sourceLink: { alignSelf: 'flex-start', marginTop: 8, paddingVertical: 3 },
+  sourceLinkText: { color: '#5146DA', fontSize: 11, fontWeight: '800', textDecorationLine: 'underline' },
   safetyCard: { borderRadius: 13, backgroundColor: '#292544', padding: 15, marginTop: 16, marginBottom: 8 },
   safetyTitle: { color: '#F5B84B', fontWeight: '900', fontSize: 13, marginBottom: 5 },
   safetyText: { color: '#E0DCE8', fontSize: 12, lineHeight: 18 },

@@ -4,12 +4,14 @@ import asyncio
 import json
 import logging
 import os
+import re
 from typing import Any
 
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import httpx
 
@@ -21,11 +23,129 @@ app = FastAPI(title="PharmaLens", version="0.1.0")
 logger = logging.getLogger("uvicorn.error")
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 SUPPORTED_MEDIA_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+allowed_origins = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", "http://localhost:8081,http://localhost:19006").split(",")
+    if origin.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
+)
+
+
+@app.exception_handler(Exception)
+async def unhandled_api_error(request: Request, exc: Exception) -> JSONResponse:
+    """Log unexpected failures and keep the API error response readable by Expo."""
+    logger.exception("Unhandled API error for %s %s", request.method, request.url.path)
+    detail = str(exc).strip() or "No additional error details were provided."
+    for secret_name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        secret = os.getenv(secret_name)
+        if secret:
+            detail = detail.replace(secret, "[redacted]")
+    detail = re.sub(r"AIza[0-9A-Za-z_-]{20,}", "[redacted API key]", detail)[:300]
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": f"Server error ({type(exc).__name__}): {detail}"
+        },
+    )
 
 
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+async def add_common_medicine_purposes(
+    result: dict[str, Any], api_key: str, model: str
+) -> None:
+    """Add brief, AI-generated common uses without claiming web verification."""
+    medicines = result.get("medicines", [])
+    candidates: list[dict[str, Any]] = []
+    for index, medicine in enumerate(medicines):
+        generic = str(medicine.get("generic_name") or "").strip()
+        name = str(medicine.get("name") or "").strip()
+        query_name = generic if generic and generic.casefold() != "unclear" else name
+        confidence = medicine.get("confidence")
+        if (
+            not query_name
+            or query_name.casefold() == "unclear"
+            or (isinstance(confidence, (float, int)) and confidence < 0.6)
+        ):
+            _set_unavailable_purpose(medicine)
+            continue
+        candidates.append({"index": index, "name": query_name})
+
+    if not candidates:
+        return
+
+    client = genai.Client(api_key=api_key)
+    try:
+        response = await asyncio.wait_for(
+            client.aio.models.generate_content(
+                model=model,
+                contents=(
+                    "For each confidently identified medicine below, describe its common general use in one short, "
+                    "plain-language English sentence and one faithful Urdu sentence. Use general medical knowledge; "
+                    "these descriptions are not verified references. Do not guess a patient's reason for taking it, "
+                    "diagnose, recommend treatment, or mention dose. If the medicine identity is not clear, leave both "
+                    "sentences empty. Preserve each input index exactly. Input: "
+                    + json.dumps(candidates, ensure_ascii=False)
+                ),
+                config=types.GenerateContentConfig(
+                    max_output_tokens=600,
+                    response_mime_type="application/json",
+                    response_schema={
+                        "type": "OBJECT",
+                        "properties": {
+                            "medicines": {
+                                "type": "ARRAY",
+                                "items": {
+                                    "type": "OBJECT",
+                                    "properties": {
+                                        "index": {"type": "INTEGER"},
+                                        "purpose_en": {"type": "STRING"},
+                                        "purpose_ur": {"type": "STRING"},
+                                    },
+                                    "required": ["index", "purpose_en", "purpose_ur"],
+                                },
+                            }
+                        },
+                        "required": ["medicines"],
+                    },
+                    system_instruction=(
+                        "Give cautious, general educational information only. Common uses may be incomplete or "
+                        "incorrect and are not verified. Never infer why a particular patient was prescribed a medicine. "
+                        "Do not provide dose advice."
+                    ),
+                ),
+            ),
+            timeout=30,
+        )
+        payload = json.loads((response.text or "").strip())
+        for item in payload.get("medicines", []):
+            index = item.get("index")
+            if not isinstance(index, int) or index < 0 or index >= len(medicines):
+                continue
+            purpose_en = str(item.get("purpose_en") or "").strip()
+            purpose_ur = str(item.get("purpose_ur") or "").strip()
+            if purpose_en and purpose_ur:
+                medicine = medicines[index]
+                medicine["purpose_en"] = purpose_en
+                medicine["purpose_ur"] = purpose_ur
+                medicine["explanation"] = purpose_en
+                medicine["urdu_explanation"] = purpose_ur
+    finally:
+        await client.aio.aclose()
+
+
+def _set_unavailable_purpose(medicine: dict[str, Any]) -> None:
+    medicine["purpose_en"] = "The medicine could not be identified clearly, so a common use is not shown."
+    medicine["purpose_ur"] = "دوا کی شناخت واضح نہیں ہو سکی، اس لیے اس کا عام استعمال نہیں دکھایا گیا۔"
 
 
 @app.post("/extract")
@@ -66,7 +186,6 @@ async def extract(
                 config=types.GenerateContentConfig(
                     max_output_tokens=2048,
                     response_mime_type="application/json",
-                    thinking_config=types.ThinkingConfig(thinking_level="minimal"),
                     system_instruction=(
                         f"The user selected {language} as the prescription language; use that as a "
                         "hint, but inspect the handwriting and report the language actually detected. "
@@ -136,6 +255,11 @@ async def extract(
         result = extract_medicines(result, language=language)
     except (TypeError, ValueError, KeyError) as exc:
         raise HTTPException(status_code=502, detail="Could not process the extracted medicines.") from exc
+
+    try:
+        await add_common_medicine_purposes(result, api_key, model)
+    except Exception as exc:
+        logger.warning("AI common-use descriptions could not be generated: %s", exc)
 
     result["safety_note"] = "Confirm all prescription details with your pharmacist or doctor."
     return JSONResponse(content=result)

@@ -15,7 +15,16 @@
         }
       ],
       "expo-router",
-      "expo-status-bar"
+      "expo-status-bar",
+      [
+        "expo-audio",
+        {
+          "microphonePermission": false,
+          "recordAudioAndroid": false,
+          "enableBackgroundRecording": false,
+          "enableBackgroundPlayback": false
+        }
+      ]
     ],
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -32,6 +41,7 @@
       }
     },
     "web": {
+      "output": "static",
       "favicon": "./assets/favicon.png"
     }
   }
